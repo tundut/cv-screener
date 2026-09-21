@@ -1,0 +1,5 @@
+boto3
+python-dotenv
+PyPDF2
+streamlit[auth]
+pytest

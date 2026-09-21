@@ -1,0 +1,110 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: CV Screener serverless starter resources.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 60
+    MemorySize: 512
+
+Resources:
+  CvBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Function: !GetAtt CvProcessorFunction.Arn
+
+  CvResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+        - AttributeName: created_at
+          KeyType: RANGE
+
+  CvUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: cv-screener-users
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireUppercase: true
+
+  CvUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref CvUserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      CallbackURLs:
+        - http://localhost:8501/oauth2callback
+      LogoutURLs:
+        - http://localhost:8501
+      SupportedIdentityProviders:
+        - COGNITO
+
+  CvUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub cv-screener-${AWS::AccountId}
+      UserPoolId: !Ref CvUserPool
+
+  CvProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: handler.lambda_handler
+      Environment:
+        Variables:
+          RESULTS_TABLE: !Ref CvResultsTable
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref CvBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CvResultsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - textract:StartDocumentTextDetection
+              Resource: '*'
+      Events:
+        CvUpload:
+          Type: S3
+          Properties:
+            Bucket: !Ref CvBucket
+            Events: s3:ObjectCreated:Put
+
+Outputs:
+  CvBucketName:
+    Value: !Ref CvBucket
+  CvResultsTableName:
+    Value: !Ref CvResultsTable
+  CvUserPoolId:
+    Value: !Ref CvUserPool
+  CvUserPoolClientId:
+    Value: !Ref CvUserPoolClient
+  CvUserPoolIssuer:
+    Value: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${CvUserPool}
