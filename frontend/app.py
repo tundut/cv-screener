@@ -1,4 +1,5 @@
 import json
+import hashlib
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -13,6 +14,9 @@ from backend.bedrock import evaluate_cv
 from backend.config import load_settings
 from backend.history import delete_evaluation, get_user_id, list_evaluations, save_evaluation
 from backend.pdf_extractor import extract_text_from_pdf
+from backend.storage import upload_evaluation_context, upload_resume
+
+from backend.mock_ai import evaluate_cv_mock
 
 
 st.set_page_config(page_title="CV Screener", page_icon="📄", layout="wide", initial_sidebar_state="expanded")
@@ -41,6 +45,13 @@ st.markdown(
     [data-testid="stSidebar"] .stCaption { color: #d9e7e3 !important; }
     [data-testid="stSidebar"] button,
     [data-testid="stSidebar"] button * { color: #edf4f1 !important; }
+    [data-testid="stHeader"],
+    [data-testid="stHeader"] *,
+    [data-testid="stHeader"] button,
+    [data-testid="stHeader"] button *,
+    [data-testid="stHeader"] [data-testid="stDecoration"],
+    [data-testid="stHeader"] [data-testid="stDecoration"] *,
+
     [data-testid="stAppViewContainer"] h1,
     [data-testid="stAppViewContainer"] h2,
     [data-testid="stAppViewContainer"] h3,
@@ -72,16 +83,7 @@ st.markdown(
         background: var(--ink) !important;
     }
     [data-testid="stAppViewContainer"] [data-testid="stExpander"] summary:hover {
-            background: var(--muted) !important;
-    }
-    [data-testid="stAppViewContainer"] .stDownloadButton button,
-    [data-testid="stAppViewContainer"] .stDownloadButton button * {
-        color: #f5f9fa !important;
-        fill: #f5f9fa !important;
-    }
-    [data-testid="stAppViewContainer"] .stDownloadButton button {
-        background: var(--ink) !important;
-        border: 1px solid #2f5568 !important;
+            background: #2f5568 !important;
     }
     [data-testid="stAppViewContainer"] .stButton button[kind="primary"] { color: white !important; background: var(--orange); }
     .brand { padding: .6rem 0 2rem; }
@@ -103,7 +105,7 @@ st.markdown(
 
 
 def clear_session() -> None:
-    for key in ("evaluation", "cv_text", "job_description"):
+    for key in ("evaluation", "cv_text", "job_description", "resume_s3_key", "resume_signature"):
         st.session_state.pop(key, None)
 
 
@@ -192,6 +194,10 @@ def render_evaluation(result: dict) -> None:
             }
             div[data-testid="stDownloadButton"] button {
                 background: var(--ink) !important;
+                border-color: #2f5568 !important;
+            }
+            div[data-testid="stDownloadButton"] button:hover {
+                background: #2f5568 !important;
                 border-color: #2f5568 !important;
             }
             div[data-testid="stButton"] button[kind="secondary"] {
@@ -286,11 +292,27 @@ with evaluate_tab:
         cv_text = ""
         if uploaded_file:
             try:
-                cv_text = extract_text_from_pdf(uploaded_file.getvalue())
+                file_content = uploaded_file.getvalue()
+                file_signature = hashlib.sha256(file_content).hexdigest()
+                if file_signature != st.session_state.get("resume_signature"):
+                    if settings.cv_bucket_name:
+                        st.session_state.resume_s3_key = upload_resume(
+                            settings,
+                            user_id,
+                            uploaded_file.name,
+                            file_content,
+                        )
+                    st.session_state.resume_signature = file_signature
+
+                cv_text = extract_text_from_pdf(file_content)
                 st.session_state.cv_text = cv_text
                 st.success(f"{uploaded_file.name}  ·  {len(cv_text):,} characters extracted")
+                if st.session_state.get("resume_s3_key"):
+                    st.caption("Resume uploaded to your private S3 folder.")
+                else:
+                    st.warning("CV_BUCKET_NAME is not configured; the resume is only stored in this session.")
             except Exception as error:
-                st.error(f"Could not read this PDF: {error}")
+                st.error(f"Could not process this PDF: {error}")
         elif st.session_state.get("cv_text"):
             cv_text = st.session_state.cv_text
 
@@ -310,8 +332,23 @@ with evaluate_tab:
     if evaluate_clicked:
         with st.spinner("Reading the profile against the role brief..."):
             try:
-                result = evaluate_cv(cv_text, st.session_state.job_description, settings)
+                if settings.ai_provider == "mock":
+                    result = evaluate_cv_mock(cv_text, st.session_state.job_description)
+                else:
+                    result = evaluate_cv(cv_text, st.session_state.job_description, settings)
+
                 result["job_description"] = st.session_state.job_description
+                if settings.cv_bucket_name and st.session_state.get("resume_s3_key"):
+                    try:
+                        result["s3_evaluation_key"] = upload_evaluation_context(
+                            settings,
+                            user_id,
+                            st.session_state.resume_s3_key,
+                            st.session_state.job_description,
+                            result,
+                        )
+                    except Exception as error:
+                        st.warning(f"Evaluation completed, but the S3 copy could not be saved: {error}")
                 save_evaluation(settings, user_id, result)
                 st.session_state.evaluation = result
                 st.success("Evaluation saved to your account history.")

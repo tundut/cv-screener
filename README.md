@@ -15,6 +15,7 @@ CV Screener is a serverless application for recruiters and hiring teams. It extr
 - Compare the resume with a job description.
 - Generate a structured fit score with strengths, gaps, and a summary.
 - Save evaluation history per Cognito account.
+- Store uploaded resumes and evaluation context in the configured S3 bucket.
 - Download an evaluation as JSON.
 - Review the extracted CV evidence before making a hiring decision.
 
@@ -52,6 +53,7 @@ backend/
   handler.py          # S3-triggered Lambda starter
   history.py          # DynamoDB history access
   pdf_extractor.py    # PDF text extraction
+  storage.py          # S3 resume and evaluation uploads
 frontend/
   app.py              # Streamlit dashboard
 prompts/
@@ -90,6 +92,11 @@ CV_BUCKET_NAME=your-bucket-name
 CV_RESULTS_TABLE=cv-evaluations
 BEDROCK_MODEL_ID=apac.amazon.nova-lite-v1:0
 ```
+
+When a resume is selected, the dashboard stores the PDF under
+`users/<cognito-user-id>/resumes/`. When an evaluation is submitted, it stores
+a JSON object under `users/<cognito-user-id>/evaluations/` containing the job
+description, the resume S3 key, and the evaluation result.
 
 Check available profiles with:
 
