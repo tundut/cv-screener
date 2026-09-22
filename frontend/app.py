@@ -11,7 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from backend.bedrock import evaluate_cv
 from backend.config import load_settings
-from backend.history import get_user_id, list_evaluations, save_evaluation
+from backend.history import delete_evaluation, get_user_id, list_evaluations, save_evaluation
 from backend.pdf_extractor import extract_text_from_pdf
 
 
@@ -25,8 +25,20 @@ st.markdown(
     .stApp { background: var(--paper); }
     [data-testid="stHeader"] { background: rgba(245,247,244,.86); }
     [data-testid="stSidebar"] { background: #152a3a; }
-    [data-testid="stSidebar"] * { color: #edf4f1; }
-    [data-testid="stSidebar"] .stCaption { color: #b8cbc9 !important; }
+    [data-testid="stSidebar"],
+    [data-testid="stSidebar"] *,
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] div,
+    [data-testid="stSidebar"] span,
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] code,
+    [data-testid="stSidebar"] pre,
+    [data-testid="stSidebar"] .stMarkdownContainer,
+    [data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+    [data-testid="stSidebar"] .stCaption {
+        color: #edf4f1 !important;
+    }
+    [data-testid="stSidebar"] .stCaption { color: #d9e7e3 !important; }
     [data-testid="stSidebar"] button,
     [data-testid="stSidebar"] button * { color: #edf4f1 !important; }
     [data-testid="stAppViewContainer"] h1,
@@ -41,9 +53,36 @@ st.markdown(
     [data-testid="stAppViewContainer"] [data-baseweb="tab-list"] button * { color: var(--muted) !important; }
     [data-testid="stAppViewContainer"] [data-baseweb="tab-list"] button[aria-selected="true"],
     [data-testid="stAppViewContainer"] [data-baseweb="tab-list"] button[aria-selected="true"] * { color: var(--orange) !important; }
+    [data-testid="stAppViewContainer"] [data-testid="stExpander"] {
+        background: white !important;
+        border: 1px solid #dfe7e5 !important;
+        border-radius: 12px !important;
+    }
     [data-testid="stAppViewContainer"] [data-testid="stExpander"] summary,
-    [data-testid="stAppViewContainer"] [data-testid="stExpander"] summary * { color: #edf4f1 !important; }
-    [data-testid="stAppViewContainer"] .stDownloadButton button { color: #edf4f1 !important; background: var(--ink); }
+    [data-testid="stAppViewContainer"] [data-testid="stExpander"] summary *,
+    [data-testid="stAppViewContainer"] [data-testid="stExpander"] [data-testid="stExpanderToggleIcon"],
+    [data-testid="stAppViewContainer"] [data-testid="stExpander"] svg,
+    [data-testid="stAppViewContainer"] [data-testid="stExpander"] path,
+    [data-testid="stAppViewContainer"] [data-testid="stExpander"] .streamlit-expanderContent,
+    [data-testid="stAppViewContainer"] [data-testid="stExpander"] .streamlit-expanderContent * {
+        color: #edf4f1 !important;
+        fill: #edf4f1 !important;
+    }
+    [data-testid="stAppViewContainer"] [data-testid="stExpander"] summary {
+        background: var(--ink) !important;
+    }
+    [data-testid="stAppViewContainer"] [data-testid="stExpander"] summary:hover {
+            background: var(--muted) !important;
+    }
+    [data-testid="stAppViewContainer"] .stDownloadButton button,
+    [data-testid="stAppViewContainer"] .stDownloadButton button * {
+        color: #f5f9fa !important;
+        fill: #f5f9fa !important;
+    }
+    [data-testid="stAppViewContainer"] .stDownloadButton button {
+        background: var(--ink) !important;
+        border: 1px solid #2f5568 !important;
+    }
     [data-testid="stAppViewContainer"] .stButton button[kind="primary"] { color: white !important; background: var(--orange); }
     .brand { padding: .6rem 0 2rem; }
     .brand-mark { color: #f5a66f; font-size: 2rem; font-weight: 800; letter-spacing: .02em; }
@@ -76,6 +115,21 @@ def render_list(items: list[str], empty_message: str) -> None:
         st.caption(empty_message)
 
 
+def format_history_timestamp(raw_value: object) -> str:
+    if not raw_value:
+        return "Unknown time"
+    value = str(raw_value)
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        dt = __import__("datetime").datetime.fromisoformat(value)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(__import__("datetime").timezone.utc)
+        return dt.strftime("%d/%m/%Y %H:%M UTC")
+    except ValueError:
+        return value
+
+
 def json_default(value: object) -> object:
     if isinstance(value, Decimal):
         return float(value)
@@ -85,6 +139,7 @@ def json_default(value: object) -> object:
 def render_evaluation(result: dict) -> None:
     st.markdown("## Evaluation snapshot")
     score = max(0, min(100, float(result.get("fit_score", 0))))
+    result_key = result.get("evaluation_id") or result.get("candidate_name") or str(id(result))
     score_col, summary_col, export_col = st.columns([.8, 1.65, .75], gap="large")
     with score_col:
         st.markdown(f'<div class="result-score">{score:.0f}<span style="font-size:1.3rem"> / 100</span></div>', unsafe_allow_html=True)
@@ -93,7 +148,64 @@ def render_evaluation(result: dict) -> None:
         st.markdown(f'<div class="result-name">{result.get("candidate_name", "Candidate")}</div>', unsafe_allow_html=True)
         st.write(result.get("summary", "No summary returned."))
     with export_col:
-        st.download_button("Download JSON", json.dumps(result, indent=2, default=json_default), file_name="cv-evaluation.json", mime="application/json", use_container_width=True)
+        st.download_button(
+            "Download JSON",
+            json.dumps(result, indent=2, default=json_default),
+            file_name=f"cv-evaluation-{result_key}.json",
+            mime="application/json",
+            use_container_width=True,
+            key=f"download_json_{result_key}",
+        )
+        if st.button(
+            "Delete record",
+            key=f"delete_record_{result_key}",
+            use_container_width=True,
+            type="secondary",
+        ):
+            try:
+                delete_evaluation(settings, user_id, result)
+                st.success("Record deleted from your account.")
+                st.rerun()
+            except Exception as error:
+                st.error(f"Could not delete this record: {error}")
+
+        st.markdown(
+            """
+            <style>
+            div[data-testid="stDownloadButton"] button,
+            div[data-testid="stDownloadButton"] button *,
+            div[data-testid="stButton"] button[kind="secondary"],
+            div[data-testid="stButton"] button[kind="secondary"] * {
+                color: #f5f9fa !important;
+                fill: #f5f9fa !important;
+                font-size: 0.92rem !important;
+                font-weight: 600 !important;
+                letter-spacing: 0.01em !important;
+            }
+            div[data-testid="stDownloadButton"] button,
+            div[data-testid="stButton"] button[kind="secondary"] {
+                height: 44px !important;
+                padding: 0.65rem 1rem !important;
+                border-radius: 0.6rem !important;
+                border: 1px solid transparent !important;
+                box-shadow: none !important;
+            }
+            div[data-testid="stDownloadButton"] button {
+                background: var(--ink) !important;
+                border-color: #2f5568 !important;
+            }
+            div[data-testid="stButton"] button[kind="secondary"] {
+                background: #d64545 !important;
+                border-color: #bb2f2f !important;
+            }
+            div[data-testid="stButton"] button[kind="secondary"]:hover {
+                background: #c53030 !important;
+                border-color: #a82727 !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
 
     st.progress(score / 100, text=f"Fit score  ·  {score:.0f}%")
     strengths_col, gaps_col = st.columns(2, gap="large")
@@ -158,7 +270,8 @@ with history_tab:
     if not evaluations:
         st.caption("No saved evaluations yet. Complete your first evaluation in the New evaluation tab.")
     for evaluation in evaluations:
-        label = f"{evaluation.get('candidate_name', 'Candidate')}  ·  {evaluation.get('fit_score', 0)}/100  ·  {evaluation.get('created_at', '')}"
+        created_at = format_history_timestamp(evaluation.get("created_at"))
+        label = f"{evaluation.get('candidate_name', 'Candidate')}  ·  {evaluation.get('fit_score', 0)}/100  ·  {created_at}"
         with st.expander(label):
             render_evaluation(evaluation)
 

@@ -34,6 +34,23 @@ def save_evaluation(settings: Settings, user_id: str, result: dict[str, Any]) ->
     return item
 
 
+def delete_evaluation(settings: Settings, user_id: str, evaluation: dict[str, Any]) -> None:
+    if not settings.cv_results_table:
+        raise RuntimeError("CV_RESULTS_TABLE is not configured")
+
+    job_id = evaluation.get("job_id")
+    candidate_id = evaluation.get("candidate_id")
+    if not job_id or not candidate_id:
+        raise ValueError("This evaluation record is missing its DynamoDB key fields and cannot be deleted.")
+
+    table = boto3.resource("dynamodb", region_name=settings.aws_region).Table(settings.cv_results_table)
+    table.delete_item(
+        Key={"job_id": str(job_id), "candidate_id": str(candidate_id)},
+        ConditionExpression="user_id = :user_id",
+        ExpressionAttributeValues={":user_id": user_id},
+    )
+
+
 def list_evaluations(settings: Settings, user_id: str, limit: int = 25) -> list[dict[str, Any]]:
     if not settings.cv_results_table:
         return []
