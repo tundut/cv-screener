@@ -1,0 +1,14 @@
+.venv/
+.git/
+.aws-sam/
+.pytest_cache/
+__pycache__/
+tests/
+frontend/
+.streamlit/
+.env
+.env.example
+README.md
+samconfig.toml
+*.pyc
+.DS_Store

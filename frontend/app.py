@@ -10,13 +10,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from backend.bedrock import evaluate_cv
 from backend.config import load_settings
+from backend.evaluator import run_evaluation
 from backend.history import delete_evaluation, get_user_id, list_evaluations, save_evaluation
 from backend.pdf_extractor import extract_text_from_pdf
-from backend.storage import upload_evaluation_context, upload_resume
-
-from backend.mock_ai import evaluate_cv_mock
+from backend.storage import create_presigned_download_url, upload_evaluation_context, upload_resume
 
 
 st.set_page_config(page_title="CV Screener", page_icon="📄", layout="wide", initial_sidebar_state="expanded")
@@ -117,6 +115,31 @@ def render_list(items: list[str], empty_message: str) -> None:
         st.caption(empty_message)
 
 
+def merge_recent_evaluations(recent: list, stored: list) -> list:
+    """Combine this-session records with the stored history, newest first.
+
+    Records are de-duplicated by evaluation_id (falling back to the
+    job_id/candidate_id pair) so a just-saved item is not shown twice once
+    DynamoDB catches up.
+    """
+    def record_id(item: dict) -> tuple:
+        return (
+            item.get("evaluation_id")
+            or (item.get("job_id"), item.get("candidate_id")),
+        )
+
+    merged: list = []
+    seen: set = set()
+    for item in [*recent, *stored]:
+        key = record_id(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+
+    return sorted(merged, key=lambda item: str(item.get("created_at", "")), reverse=True)
+
+
 def format_history_timestamp(raw_value: object) -> str:
     if not raw_value:
         return "Unknown time"
@@ -214,6 +237,31 @@ def render_evaluation(result: dict) -> None:
         )
 
     st.progress(score / 100, text=f"Fit score  ·  {score:.0f}%")
+    st.markdown("### Source documents")
+    document_col, jd_col = st.columns(2, gap="large")
+    with document_col:
+        st.markdown("**Resume**")
+        resume_key = result.get("resume_s3_key")
+        if resume_key:
+            try:
+                resume_url = create_presigned_download_url(settings, user_id, str(resume_key))
+                st.link_button("Open raw CV (PDF)", resume_url, use_container_width=True)
+                st.caption("The link is private and expires after 5 minutes.")
+            except Exception as error:
+                st.error(f"Could not open the raw CV: {error}")
+        else:
+            st.caption("The original CV is not linked to this record.")
+    with jd_col:
+        st.markdown("**Job description**")
+        st.text_area(
+            "Job description",
+            value=str(result.get("job_description", "")),
+            height=140,
+            disabled=True,
+            label_visibility="collapsed",
+            key=f"job_description_{result_key}",
+        )
+
     strengths_col, gaps_col = st.columns(2, gap="large")
     with strengths_col:
         st.markdown("### Strong matches")
@@ -273,6 +321,13 @@ with history_tab:
     except Exception as error:
         evaluations = []
         st.error(f"Could not load evaluation history: {error}")
+
+    # Merge records saved during this session so a just-completed evaluation
+    # appears immediately, even before DynamoDB reflects it in a scan/query.
+    evaluations = merge_recent_evaluations(
+        st.session_state.get("recent_evaluations", []), evaluations
+    )
+
     if not evaluations:
         st.caption("No saved evaluations yet. Complete your first evaluation in the New evaluation tab.")
     for evaluation in evaluations:
@@ -301,6 +356,7 @@ with evaluate_tab:
                             user_id,
                             uploaded_file.name,
                             file_content,
+                            job_description=st.session_state.get("job_description", ""),
                         )
                     st.session_state.resume_signature = file_signature
 
@@ -332,12 +388,10 @@ with evaluate_tab:
     if evaluate_clicked:
         with st.spinner("Reading the profile against the role brief..."):
             try:
-                if settings.ai_provider == "mock":
-                    result = evaluate_cv_mock(cv_text, st.session_state.job_description)
-                else:
-                    result = evaluate_cv(cv_text, st.session_state.job_description, settings)
+                result = run_evaluation(cv_text, st.session_state.job_description, settings)
 
                 result["job_description"] = st.session_state.job_description
+                result["resume_s3_key"] = st.session_state.get("resume_s3_key", "")
                 if settings.cv_bucket_name and st.session_state.get("resume_s3_key"):
                     try:
                         result["s3_evaluation_key"] = upload_evaluation_context(
@@ -349,13 +403,24 @@ with evaluate_tab:
                         )
                     except Exception as error:
                         st.warning(f"Evaluation completed, but the S3 copy could not be saved: {error}")
-                save_evaluation(settings, user_id, result)
+                saved_item = save_evaluation(settings, user_id, result)
                 st.session_state.evaluation = result
-                st.success("Evaluation saved to your account history.")
+                # Keep the saved record for this session so the History tab shows
+                # it immediately, without waiting for DynamoDB read consistency.
+                recent = st.session_state.get("recent_evaluations", [])
+                recent.insert(0, saved_item)
+                st.session_state.recent_evaluations = recent
+                # Rerun so the History tab (rendered earlier in the script) picks
+                # up the new record right away.
+                st.session_state.evaluation_just_saved = True
+                st.rerun()
             except Exception as error:
                 st.error(str(error))
                 if not settings.bedrock_model_id:
                     st.info("Configure BEDROCK_MODEL_ID and AWS credentials in .env before using cloud evaluation.")
+
+    if st.session_state.pop("evaluation_just_saved", False):
+        st.success("Evaluation saved. See it in the Evaluation history tab.")
 
     if result := st.session_state.get("evaluation"):
         render_evaluation(result)

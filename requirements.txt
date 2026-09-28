@@ -2,4 +2,5 @@ boto3
 python-dotenv
 PyPDF2
 streamlit[auth]
+openai>=1.40,<2
 pytest

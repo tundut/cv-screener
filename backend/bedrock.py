@@ -4,8 +4,12 @@ from typing import Any
 import boto3
 from botocore.exceptions import ClientError
 
-from .config import Settings
-from .prompting import build_evaluation_prompt
+try:  # Package context (tests, dashboard)
+    from .config import Settings
+    from .prompting import build_evaluation_prompt
+except ImportError:  # Flat context (Lambda: CodeUri backend/)
+    from config import Settings
+    from prompting import build_evaluation_prompt
 
 
 def evaluate_cv(cv_text: str, job_description: str, settings: Settings) -> dict[str, Any]:
@@ -37,13 +41,41 @@ def evaluate_cv(cv_text: str, job_description: str, settings: Settings) -> dict[
 
 
 def _parse_evaluation(output_text: str) -> dict[str, Any]:
-    try:
-        result = json.loads(output_text)
-    except json.JSONDecodeError as error:
-        raise ValueError("Bedrock returned invalid JSON") from error
+    result = _load_json_object(output_text)
 
     required_keys = {"candidate_name", "fit_score", "summary", "strengths", "gaps"}
     missing_keys = required_keys - result.keys()
     if missing_keys:
         raise ValueError(f"Bedrock response is missing: {', '.join(sorted(missing_keys))}")
+
+    result["fit_score"] = _coerce_fit_score(result["fit_score"])
     return result
+
+
+def _load_json_object(output_text: str) -> dict[str, Any]:
+    """Parse a JSON object, tolerating markdown fences or surrounding prose."""
+    text = (output_text or "").strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        # Models often wrap JSON in ```json fences or add a sentence around it.
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end < start:
+            raise ValueError("Bedrock returned invalid JSON")
+        try:
+            parsed = json.loads(text[start : end + 1])
+        except json.JSONDecodeError as error:
+            raise ValueError("Bedrock returned invalid JSON") from error
+
+    if not isinstance(parsed, dict):
+        raise ValueError("Bedrock returned invalid JSON")
+    return parsed
+
+
+def _coerce_fit_score(value: Any) -> float:
+    """Bedrock sometimes returns the score as a string; normalize to a number."""
+    try:
+        return float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Bedrock returned a non-numeric fit_score") from error

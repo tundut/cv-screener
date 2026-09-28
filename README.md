@@ -40,9 +40,8 @@ The planned AWS services are:
 | Streamlit | Local dashboard and review workflow |
 | Amazon Bedrock | CV and job-description evaluation |
 | DynamoDB | Per-user evaluation history |
-| Amazon S3 | CV file storage in the serverless workflow |
-| AWS Lambda | Event-driven processing |
-| Amazon Textract | PDF text extraction in the serverless workflow |
+| Amazon S3 | CV file storage and upload trigger for the pipeline |
+| AWS Lambda | Event-driven resume evaluation on upload |
 
 ## Project Structure
 
@@ -50,20 +49,36 @@ The planned AWS services are:
 backend/
   bedrock.py          # Bedrock Converse API and response validation
   config.py           # Environment configuration
-  handler.py          # S3-triggered Lambda starter
+  handler.py          # S3-triggered Lambda entry point
+  pipeline.py         # Shared resume -> evaluate -> save pipeline
   history.py          # DynamoDB history access
   pdf_extractor.py    # PDF text extraction
   storage.py          # S3 resume and evaluation uploads
+  Makefile            # SAM custom build (bundles prompts + PyPDF2)
+  prompts/
+    cv_evaluation.txt # Evaluation prompt and JSON contract
 frontend/
   app.py              # Streamlit dashboard
-prompts/
-  cv_evaluation.txt   # Evaluation prompt and JSON contract
 tests/
+  test_bedrock.py
   test_history.py
+  test_pipeline.py
   test_prompting.py
 template.yaml          # AWS SAM infrastructure
 requirements.txt       # Python dependencies
 ```
+
+## Serverless Evaluation Pipeline
+
+Uploading a resume to `users/<user-id>/resumes/` in the CV bucket triggers
+`CvProcessorFunction`. The Lambda downloads the PDF, extracts text, and — when a
+job description is attached to the object metadata — evaluates it with Bedrock
+and writes the result to the same DynamoDB history table the dashboard reads.
+The dashboard attaches the current role brief as `job-description` metadata when
+it uploads a resume, so both the interactive and event-driven paths converge on
+one history store. Objects without a job description are skipped and evaluated
+interactively instead; evaluation JSON written back under `evaluations/` never
+re-triggers the pipeline.
 
 ## Quick Start
 
@@ -84,14 +99,29 @@ aws configure
 
 ### 2. Configure environment variables
 
-For `ap-southeast-1`, use an inference profile rather than the direct on-demand model ID:
+Choose an evaluation provider with `AI_PROVIDER` (`openai`, `bedrock`, or
+`mock`). For Bedrock in `ap-southeast-1`, use an inference profile rather than
+the direct on-demand model ID.
 
 ```dotenv
 AWS_REGION=ap-southeast-1
 CV_BUCKET_NAME=your-bucket-name
 CV_RESULTS_TABLE=cv-evaluations
+
+AI_PROVIDER=openai
+
+# OpenAI platform (when AI_PROVIDER=openai)
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+# OPENAI_BASE_URL=            # only for Azure OpenAI / compatible gateway
+
+# Bedrock (when AI_PROVIDER=bedrock)
 BEDROCK_MODEL_ID=apac.amazon.nova-lite-v1:0
 ```
+
+The OpenAI provider (`backend/openai_provider.py`) uses Chat Completions in JSON
+mode and shares the same validated result contract as Bedrock, so it drops into
+both the dashboard and the S3-triggered Lambda without any other changes.
 
 When a resume is selected, the dashboard stores the PDF under
 `users/<cognito-user-id>/resumes/`. When an evaluation is submitted, it stores

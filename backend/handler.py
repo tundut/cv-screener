@@ -1,26 +1,52 @@
 import json
-import os
+import logging
 from urllib.parse import unquote_plus
 
-import boto3
+try:  # Package context (tests, dashboard: "backend.handler")
+    from .config import load_settings
+    from .pipeline import process_resume_object
+except ImportError:  # Flat context (Lambda: CodeUri backend/, module "handler")
+    from config import load_settings
+    from pipeline import process_resume_object
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 
 def lambda_handler(event, context):
-    textract = boto3.client("textract")
-    started_jobs = []
+    """S3 ObjectCreated trigger: evaluate an uploaded resume end to end.
+
+    For each new object it downloads the PDF, extracts text, runs the Bedrock
+    evaluation using the job description stored in the object metadata, and
+    saves the result to DynamoDB. Objects that are not evaluatable resumes are
+    skipped so the pipeline never re-triggers on its own output.
+    """
+    settings = load_settings()
+    processed = []
+    skipped = []
 
     for record in event.get("Records", []):
         bucket = record["s3"]["bucket"]["name"]
         key = unquote_plus(record["s3"]["object"]["key"])
-        response = textract.start_document_text_detection(
-            DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}},
-            JobTag=key,
-        )
-        started_jobs.append({"bucket": bucket, "key": key, "job_id": response["JobId"]})
+        try:
+            item = process_resume_object(settings, bucket, key)
+        except Exception:  # noqa: BLE001 - log and continue with other records
+            logger.exception("Failed to process s3://%s/%s", bucket, key)
+            skipped.append({"key": key, "status": "error"})
+            continue
+
+        if item is None:
+            skipped.append({"key": key, "status": "skipped"})
+        else:
+            processed.append(
+                {
+                    "key": key,
+                    "evaluation_id": item.get("evaluation_id"),
+                    "user_id": item.get("user_id"),
+                }
+            )
 
     return {
-        "statusCode": 202,
-        "body": json.dumps(
-            {"started_jobs": started_jobs, "results_table": os.getenv("RESULTS_TABLE", "")}
-        ),
+        "statusCode": 200,
+        "body": json.dumps({"processed": processed, "skipped": skipped}),
     }

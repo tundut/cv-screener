@@ -2,6 +2,24 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: CV Screener serverless starter resources.
 
+Parameters:
+  CvBucketName:
+    Type: String
+    Default: ''
+    Description: >-
+      Globally unique S3 bucket name for CV uploads. Leave empty to auto-name it
+      as cv-screener-<account-id>-<region>. Use the same value in the app's
+      CV_BUCKET_NAME so the dashboard and the Lambda point at one bucket.
+  BedrockModelId:
+    Type: String
+    Default: apac.amazon.nova-lite-v1:0
+    Description: >-
+      Bedrock model or inference profile ID used by the Lambda to evaluate
+      resumes. In ap-southeast-1 use an inference profile, not an on-demand ID.
+
+Conditions:
+  AutoNameBucket: !Equals [!Ref CvBucketName, '']
+
 Globals:
   Function:
     Runtime: python3.12
@@ -12,25 +30,43 @@ Resources:
   CvBucket:
     Type: AWS::S3::Bucket
     Properties:
-      NotificationConfiguration:
-        LambdaConfigurations:
-          - Event: s3:ObjectCreated:Put
-            Function: !GetAtt CvProcessorFunction.Arn
+      # A resolved (non-!Ref) name lets the function policy reference the bucket
+      # by name, which breaks the circular dependency created when a bucket both
+      # triggers and grants access to the same function.
+      BucketName: !If
+        - AutoNameBucket
+        - !Sub cv-screener-${AWS::AccountId}-${AWS::Region}
+        - !Ref CvBucketName
+    # The S3 -> Lambda notification is managed by the CvUpload event on
+    # CvProcessorFunction below.
 
   CvResultsTable:
     Type: AWS::DynamoDB::Table
     Properties:
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+        - AttributeName: candidate_id
+          AttributeType: S
         - AttributeName: user_id
           AttributeType: S
         - AttributeName: created_at
           AttributeType: S
       KeySchema:
-        - AttributeName: user_id
+        - AttributeName: job_id
           KeyType: HASH
-        - AttributeName: created_at
+        - AttributeName: candidate_id
           KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: user-created-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
 
   CvUserPool:
     Type: AWS::Cognito::UserPool
@@ -74,21 +110,35 @@ Resources:
 
   CvProcessorFunction:
     Type: AWS::Serverless::Function
+    Metadata:
+      # Custom build copies the shared prompts/ folder into the artifact so the
+      # Lambda can read cv_evaluation.txt (prompts/ lives outside CodeUri).
+      BuildMethod: makefile
     Properties:
       CodeUri: backend/
       Handler: handler.lambda_handler
       Environment:
+        # AWS_REGION is set automatically by the Lambda runtime, so
+        # load_settings() picks it up without an explicit variable here.
         Variables:
-          RESULTS_TABLE: !Ref CvResultsTable
+          CV_RESULTS_TABLE: !Ref CvResultsTable
+          CV_BUCKET_NAME: !If
+            - AutoNameBucket
+            - !Sub cv-screener-${AWS::AccountId}-${AWS::Region}
+            - !Ref CvBucketName
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
       Policies:
         - S3ReadPolicy:
-            BucketName: !Ref CvBucket
+            BucketName: !If
+              - AutoNameBucket
+              - !Sub cv-screener-${AWS::AccountId}-${AWS::Region}
+              - !Ref CvBucketName
         - DynamoDBCrudPolicy:
             TableName: !Ref CvResultsTable
         - Statement:
             - Effect: Allow
               Action:
-                - textract:StartDocumentTextDetection
+                - bedrock:InvokeModel
               Resource: '*'
       Events:
         CvUpload:
@@ -96,6 +146,11 @@ Resources:
           Properties:
             Bucket: !Ref CvBucket
             Events: s3:ObjectCreated:Put
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .pdf
 
 Outputs:
   CvBucketName:
